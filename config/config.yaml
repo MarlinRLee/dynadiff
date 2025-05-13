@@ -1,0 +1,86 @@
+data:
+  batch_size: 1
+  nsd_dataset_config:
+    nsddata_path: ./nsddata
+    subject_id: 1
+    seed: 42
+    averaged: true
+    offset: 4.6
+    duration: 8.0
+    infra:
+      cluster: slurm
+      conda_env: null
+      cpus_per_task: 10
+      folder: ./cache
+      forbid_single_item_computation: false
+      gpus_per_node: 0
+      job_name: dynadiff-prepare
+      keep_in_ram: true
+      logs: '{folder}/logs/{user}/%j'
+      mem_gb: null
+      min_samples_per_job: 8
+      mode: cached
+      nodes: 1
+      permissions: 511
+      slurm_additional_parameters: null
+      slurm_use_srun: false
+      tasks_per_node: 1
+      timeout_min: 120
+      version: '1'
+      workdir: null   
+  name: NeuroImagesDataModuleConfig
+  pin_memory: true
+  # test_groupbyimg: averaged
+  workers: 10
+infra:
+  cluster: null
+  conda_env: null
+  cpus_per_task: 10
+  folder: ./cache
+  gpus_per_node: null
+  job_name: dynadiff
+  keep_in_ram: false
+  logs: '{folder}/logs/{user}/%j'
+  mem_gb: null
+  mode: force
+  permissions: 511
+  slurm_additional_parameters: null
+  slurm_constraint: null
+  slurm_partition: null
+  slurm_use_srun: false
+  timeout_min: 4320
+  version: '1'
+  workdir: null
+seed: 33
+strategy: deepspeed
+versatilediffusion_config:
+  brain_modules_config.clip_image:
+    act_first: false
+    blurry_recon: false
+    deep_subject_layers: false
+    hidden: 1552
+    n_blocks: 0
+    n_repetition_times: 6
+    n_subjects: 1
+    name: FmriMLP
+    native_fmri_space: false
+    norm_type: ln
+    out_dim: null
+    subject_layers: true
+    subject_layers_dim: hidden
+    subject_layers_id: false
+    time_agg: out_linear
+    tr_embed_dim: 16
+    use_tr_embeds: false
+    use_tr_layer: true
+  diffusion_noise_offset: true
+  drop_rate_clsfree: 0.1
+  in_dim: 15724
+  name: VersatileDiffusion
+  noise_cubic_sampling: true
+  num_inference_steps: 20
+  prediction_type: epsilon
+  trainable_unet_layers: lora
+  training_strategy: w/_difloss
+  vd_cache_dir: null
+

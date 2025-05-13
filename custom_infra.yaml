@@ -1,0 +1,30 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+task_infra_data:
+  cluster: auto
+  folder: ./cache
+  cpus_per_task: 10
+  gpus_per_node: 0
+  max_jobs: 128
+  min_samples_per_job: 8
+  slurm_partition: null
+  slurm_constraint: null
+  timeout_min: 30
+
+map_infra_image_generation:
+  cluster: auto
+  folder: ./cache
+  cpus_per_task: 8
+  min_samples_per_job: 10
+  max_jobs: 128
+  gpus_per_node: 1
+  slurm_partition: null
+  slurm_constraint: null
+  timeout_min: 25
+
+
+
