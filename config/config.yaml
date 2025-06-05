@@ -1,8 +1,8 @@
 data:
-  batch_size: 1
+  batch_size: 8
   nsd_dataset_config:
     nsddata_path: ./nsddata
-    subject_id: 1
+    #subject_id: 1
     seed: 42
     averaged: true
     offset: 4.6
@@ -61,7 +61,7 @@ versatilediffusion_config:
     hidden: 1552
     n_blocks: 0
     n_repetition_times: 6
-    n_subjects: 1
+    n_subjects: 4
     name: FmriMLP
     native_fmri_space: false
     norm_type: ln
@@ -75,7 +75,7 @@ versatilediffusion_config:
     use_tr_layer: true
   diffusion_noise_offset: true
   drop_rate_clsfree: 0.1
-  in_dim: 15724
+  in_dim: 16724
   name: VersatileDiffusion
   noise_cubic_sampling: true
   num_inference_steps: 20

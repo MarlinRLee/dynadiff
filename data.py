@@ -20,11 +20,14 @@ from lightning.pytorch import LightningDataModule
 from PIL import Image
 from torch.utils.data import DataLoader
 import os
-
+import concurrent.futures
+import multiprocessing
+from tqdm.auto import tqdm
+import torch.nn.functional as F
 
 TR_s = 4 / 3
 
-
+MAX_FMRI_FEATURES = 16724
 class NsdDataset(torch.utils.data.Dataset):
     def __init__(self, processed_data_paths: list[dict]):
         self.processed_data_paths = processed_data_paths
@@ -39,6 +42,14 @@ class NsdDataset(torch.utils.data.Dataset):
         fmri = torch.from_numpy(np.load(data_info["fmri_path"])).float()
         image = torch.from_numpy(np.load(data_info["image_path"])).long().permute(2, 0, 1) / 255.0
         subject_id = torch.tensor(data_info["subject_idx"], dtype=torch.long)
+
+        current_features, current_timepoints = fmri.shape
+        if current_features < MAX_FMRI_FEATURES:
+            padding_needed = MAX_FMRI_FEATURES - current_features
+            # F.pad expects (padding_left, padding_right, padding_top, padding_bottom, ...)
+            # For a 2D tensor (Features, Timepoints), we pad the 'Features' dimension (dim 0)
+            # (0, 0) for timepoints (dim 1), (0, padding_needed) for features (dim 0)
+            fmri = F.pad(fmri, (0, 0, 0, padding_needed))
 
         return {"brain": fmri, "img": image, "subject_idx": subject_id}
 
@@ -94,6 +105,14 @@ class NsdDatasetConfig(pydantic.BaseModel):
 
                 im_ids = pd.read_csv(path_to_df, header=None).iloc[:, 0].to_list()
 
+                nifti_fp = (
+                    nsddata_path
+                    / f"nsddata_timeseries/ppdata/subj{subject_id:02d}/func1pt8mm/timeseries/timeseries_{run_id}.nii.gz"
+                )
+                roi_fp = (
+                    nsddata_path
+                    / f"nsddata/ppdata/subj{int(subject_id):02d}/func1pt8mm/roi/nsdgeneral.nii.gz"
+                )
                 for timestep, image_id in enumerate(im_ids):
                     if image_id == 0:
                         continue
@@ -102,14 +121,7 @@ class NsdDatasetConfig(pydantic.BaseModel):
                     #and image_id in test_im_ids:# for testing on smaller machine that can only load test data
                     if (self.dataset_split == "test" and image_id in test_im_ids) or (self.dataset_split == "train" and image_id not in test_im_ids):
                         im_fp = nsddata_path / f"nsd_stimuli/{image_id-1}.png"
-                        nifti_fp = (
-                            nsddata_path
-                            / f"nsddata_timeseries/ppdata/subj{subject_id:02d}/func1pt8mm/timeseries/timeseries_{run_id}.nii.gz"
-                        )
-                        roi_fp = (
-                            nsddata_path
-                            / f"nsddata/ppdata/subj{int(subject_id):02d}/func1pt8mm/roi/nsdgeneral.nii.gz"
-                        )
+
                         start_idx = timestep + int(round(self.offset / TR_s))
                         end_idx = timestep + int(
                             round(self.offset + self.duration) / TR_s
@@ -127,74 +139,85 @@ class NsdDatasetConfig(pydantic.BaseModel):
                         )
         return events
 
-    @infra.apply(item_uid=str, exclude_from_cache_uid=("averaged", "seed"))
-    def prepare(self, events: tp.List[ImageEvent]) -> tp.Iterator[dict]:
-        
-        for event in events:
-            # Construct paths for saving processed data
-            subject_cache_dir = Path(self.processed_data_root) / f"subj{event.subject_id:02d}" / self.dataset_split
-            os.makedirs(subject_cache_dir, exist_ok=True)
+    def _process_single_event(self, event: ImageEvent, subject_cache_dir: Path):
+        image_id_from_path = int(event.im_fp.stem) + 1
+        unique_event_id = f"{image_id_from_path}_{event.start_idx}_{event.end_idx}"
+        fmri_output_path = subject_cache_dir / f"fmri_{unique_event_id}.npy"
+        image_output_path = subject_cache_dir / f"image_{unique_event_id}.npy"
 
-            # Create a unique filename for this event's processed data
-            # Use a hash or a combination of unique identifiers for robustness
-            # For simplicity, let's use a combination of image_id, run_id, timestep for now
-            # You'll need to parse run_id and image_id from event.im_fp and event.nifti_fp if not directly available
-            # from ImageEvent. Let's infer image_id from im_fp for naming.
-            image_id_from_path = int(event.im_fp.stem) + 1 # Assuming "nsd_stimuli/X.png" means image_id=X+1
-
-            # A more robust unique ID could be a hash of all event attributes.
-            unique_event_id = f"{image_id_from_path}_{event.start_idx}_{event.end_idx}"
-
-            fmri_output_path = subject_cache_dir / f"fmri_{unique_event_id}.npy"
-            image_output_path = subject_cache_dir / f"image_{unique_event_id}.npy"
-
-            # Check if files already exist to skip re-computation (this is outside infra.apply's internal caching)
-            if fmri_output_path.exists() and image_output_path.exists():
-                yield {
-                    "fmri_path": str(fmri_output_path),
-                    "image_path": str(image_output_path),
-                    "subject_idx_original": event.subject_id,
-                    "image_id_original": image_id_from_path
-                }
-                continue
-
-
-            # If not cached or files don't exist, perform the actual processing
-            nifti = nibabel.load(event.nifti_fp, mmap=True)
-            nifti = nifti.slicer[..., :225]
-            roi_np = nibabel.load(event.roi_fp, mmap=True).get_fdata()
-            nifti_data = nifti.get_fdata()[roi_np > 0]
-
-            # z-score across run and detrend
-            nifti_data = nifti_data.T
-            shape = nifti_data.shape
-            nifti_data = nilearn.signal.clean(
-                nifti_data.reshape(shape[0], -1),
-                detrend=True,
-                high_pass=None,
-                t_r=TR_s,
-                standardize="zscore_sample",
-            )
-            nifti_data = nifti_data.reshape(shape).T
-            
-            # Extract the relevant fMRI segment
-            fmri_segment = nifti_data[..., event.start_idx : event.end_idx]
-
-            image = np.array(
-                Image.open(event.im_fp).convert("RGB").resize((512, 512), Image.BILINEAR),
-                dtype=np.uint8,
-            )
-
-            # Save processed data to .npy files
-            np.save(fmri_output_path, fmri_segment)
-            np.save(image_output_path, image)
-
-            yield {
+        if fmri_output_path.exists() and image_output_path.exists():
+            return {
                 "fmri_path": str(fmri_output_path),
                 "image_path": str(image_output_path),
                 "subject_idx_original": event.subject_id,
                 "image_id_original": image_id_from_path
             }
+
+        # If not cached, perform the actual processing
+        nifti = nibabel.load(event.nifti_fp, mmap=True)
+        nifti = nifti.slicer[..., :225]
+        roi_np = nibabel.load(event.roi_fp, mmap=True).get_fdata()
+        nifti_data = nifti.get_fdata()[roi_np > 0]
+
+        # z-score across run and detrend
+        nifti_data = nifti_data.T
+        shape = nifti_data.shape
+        nifti_data = nilearn.signal.clean(
+            nifti_data.reshape(shape[0], -1),
+            detrend=True,
+            high_pass=None,
+            t_r=TR_s,
+            standardize="zscore_sample",
+        )
+        nifti_data = nifti_data.reshape(shape).T
+
+        # Extract the relevant fMRI segment
+        fmri_segment = nifti_data[..., event.start_idx : event.end_idx]
+
+        image = np.array(
+            Image.open(event.im_fp).convert("RGB").resize((512, 512), Image.BILINEAR),
+            dtype=np.uint8,
+        )
+
+        np.save(fmri_output_path, fmri_segment)
+        np.save(image_output_path, image)
+
+        return {
+            "fmri_path": str(fmri_output_path),
+            "image_path": str(image_output_path),
+            "subject_idx_original": event.subject_id,
+            "image_id_original": image_id_from_path
+        }
+
+    @infra.apply(item_uid=str, exclude_from_cache_uid=("averaged", "seed"))
+    def prepare(self, events: tp.List[ImageEvent]) -> tp.Iterator[dict]:
+        processed_data_root_path = Path(self.processed_data_root)
+
+        # Group events by subject to manage subject_cache_dir more cleanly
+        events_by_subject = defaultdict(list)
+        for event in events:
+            events_by_subject[event.subject_id].append(event)
+
+        all_results = []
+        for sub_id, sub_events in events_by_subject.items():
+            subject_cache_dir = processed_data_root_path / f"subj{sub_id:02d}" / self.dataset_split
+            os.makedirs(subject_cache_dir, exist_ok=True)
+
+            print(f"Starting parallel processing for subject {sub_id} with {len(sub_events)} events...")
+            # Use a ProcessPoolExecutor for CPU-bound tasks
+            with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+                # Pass subject_cache_dir as an argument to the worker function
+                futures = [executor.submit(self._process_single_event, event, subject_cache_dir) for event in sub_events]
+
+
+                for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+                    all_results.append(future.result())
+
+        # The original infra.apply expects an iterator for processing, but if we're doing it all at once
+        # with multiprocessing, we return the collected list as an iterator.
+        # This also implicitly handles the `infra.apply`'s internal caching if configured.
+        return iter(all_results)
+
 
     def build(self):
         all_processed_data_info = [] # List to store paths to processed data files
@@ -288,7 +311,7 @@ class NeuroImagesDataModule(LightningDataModule):
         self.eval_dataset = None # This will be used for validation and testing
 
     def setup(self, stage: tp.Optional[str] = None):
-            all_subjects = [1, 2, 5, 7]
+            all_subjects = [1, 2, 5  ]#, 7
             # Logic to prepare datasets for different stages
             if stage == "fit" or stage is None: # 'fit' is for training
                 print("Preparing training dataset...")

@@ -14,7 +14,6 @@ import numpy as np
 import pydantic
 import torch
 import torchvision.transforms as T
-from blur import blur_faces
 from data import NeuroImagesDataModuleConfig
 from exca import MapInfra, TaskInfra
 from metrics.image_metrics import compute_image_generation_metrics
@@ -136,7 +135,7 @@ class DynaDiffEval(pydantic.BaseModel):
         metrics_gtimg = []
         for i, image in tqdm(enumerate(recons), total=len(data.eval_dataset)):
             recimg = T.ToPILImage()((image.transpose(1, 2, 0) * 255).astype(np.uint8))
-            recimg = blur_faces(recimg)
+
             recimg.save(folder / f"{i}.png")
             metrics_recimg.append(recimg)
 

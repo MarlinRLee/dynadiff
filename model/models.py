@@ -20,6 +20,9 @@ from model.peft_utils import add_adapter
 from peft import LoraConfig
 from torch import Tensor
 
+import lightning.pytorch as pl
+from collections import OrderedDict
+
 
 class DiffusionOutput(tp.NamedTuple):
     image: Tensor
@@ -61,7 +64,7 @@ class VersatileDiffusionConfig(pydantic.BaseModel):
         )
 
 
-class VersatileDiffusion(nn.Module):
+class VersatileDiffusion(pl.LightningModule):
     """End-to-end finetuning on brain signals"""
 
     def __init__(
@@ -81,6 +84,10 @@ class VersatileDiffusion(nn.Module):
         in_dim = config.in_dim
         self.brain_modules_config = config.brain_modules_config
         self.training_strategy = config.training_strategy
+
+        self.brain_n_in_channels = brain_n_in_channels
+        self.brain_temp_dim = brain_temp_dim
+
 
 
         print("VD cache dir is : ", config.vd_cache_dir)
@@ -186,6 +193,72 @@ class VersatileDiffusion(nn.Module):
             pass
         else:
             raise ValueError("config.trainable_unet_layers is unknown")
+
+    def training_step(self, batch: dict, batch_idx: int) -> Tensor:
+        """
+        Performs a single training step.
+        """
+        brain = batch["brain"]
+        img = batch["img"]
+        subject_idx = batch["subject_idx"]
+        output = self.forward(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=False)
+        # Extract losses from the output
+        total_loss = torch.tensor(0.0, device=self.device)
+        for loss_name, loss_value in output.losses.items():
+            self.log(f"train/{loss_name}_loss", loss_value, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            total_loss += loss_value
+
+        self.log("train/total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        return total_loss
+
+    def validation_step(self, batch: dict, batch_idx: int) -> Tensor:
+        """
+        Performs a single validation step.
+        """
+        brain = batch["brain"]
+        img = batch["img"]
+        subject_idx = batch["subject_idx"]
+
+        # Call the model's forward method for validation (compute loss)
+        output = self.forward(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=False)
+
+        val_total_loss = torch.tensor(0.0, device=self.device)
+        for loss_name, loss_value in output.losses.items():
+            self.log(f"val/{loss_name}_loss", loss_value, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            val_total_loss += loss_value
+
+        self.log("val/total_loss", val_total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return val_total_loss
+
+    def test_step(self, batch: dict, batch_idx: int) -> Tensor:
+        """
+        Performs a single test step (similar to validation for this model).
+        """
+        brain = batch["brain"]
+        img = batch["img"]
+        subject_idx = batch["subject_idx"]
+
+        # Call the model's forward method for testing
+        output = self.forward(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=False)
+
+        test_total_loss = torch.tensor(0.0, device=self.device)
+        for loss_name, loss_value in output.losses.items():
+            self.log(f"test/{loss_name}_loss", loss_value, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            test_total_loss += loss_value
+
+        self.log("test/total_loss", test_total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return test_total_loss
+
+    def configure_optimizers(self):
+        """
+        Configures the optimizer for training.
+        """
+        # Ensure only trainable parameters are passed to the optimizer
+        trainable_params = self.collect_parameters()
+        optimizer = optim.AdamW(trainable_params, lr=self.config.hparams.learning_rate) # Access learning_rate from hparams
+        return optimizer
+
+
 
     def get_condition(
         self, brain: Tensor, subject_idx: Tensor, **kwargs

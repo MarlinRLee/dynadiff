@@ -1,0 +1,16 @@
+*.out
+*logs
+oss_metrics.json
+nsddata/
+models/
+training_checkpoints//
+__pycache__
+img_label.npy
+diffusers/
+cache/
+checkpoints/
+processed_nsd_data/
+.vscode/
+Train_Pipeline.ipynb
+training_checkpoints/
+versatile_diffusion/

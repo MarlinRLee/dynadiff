@@ -8,7 +8,7 @@ from exca import ConfDict
 
 
 def get_cfg(
-    subject: int,
+    subjects: list[int],
     averaged_trial: bool,
     # save_recons_to: str,
     cache: str,
@@ -38,7 +38,7 @@ def get_cfg(
     config["seed"] = seed
     config["data.nsd_dataset_config.seed"] = seed
     config["data.nsd_dataset_config.averaged"] = averaged_trial
-    config["data.nsd_dataset_config.subject_id"] = subject
+    config["data.nsd_dataset_config.subject_ids"] = subjects
 
     local_infra = {
         "cluster": None,
