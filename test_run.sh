@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --time=3:00:00
+#SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
 #SBATCH --mem=100g
@@ -7,7 +7,7 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=lee02328@umn.edu
 #SBATCH -p a100-4
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:a100:2
 
 # module load cuda/11.8.0-gcc-7.2.0-xqzqlf2
 
@@ -20,4 +20,4 @@ conda activate dynadiff5
 #chmod +x setup.sh
 #./setup.sh
 
-python train.py
+deepspeed --num_gpus=2 train.py --deepspeed_config ds_config.json
