@@ -88,7 +88,7 @@ model = VersatileDiffusion(
     brain_temp_dim=brain_temp_dim,
 ).to(device)
 
-if True:
+if False:#to load a checkpoint
     checkpoint_file = "model_epoch_1.pt"
     checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_file)
 
@@ -115,7 +115,7 @@ for epoch in range(1, args.epochs + 1):
     model.train()
     total_train_loss = 0
 
-    """
+    
     for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}/{args.epochs} (Training)")):
         optimizer.zero_grad()
 
@@ -140,7 +140,7 @@ for epoch in range(1, args.epochs + 1):
         optimizer.step()
 
         wandb.log({"train/batch_loss": current_loss.item()}, step=(epoch-1)*len(train_dataloader) + batch_idx)
-    """
+    
     # --- Validation Loop ---
     model.eval()
     total_val_loss = 0
@@ -164,7 +164,7 @@ for epoch in range(1, args.epochs + 1):
 
             total_val_loss += current_val_loss.item()
 
-            if (epoch + 1 )% args.eval_freq == 0 and batch_idx < 10:
+            if (epoch + 1 )% args.eval_freq == 0 and batch_idx < args.num_eval_images:
                 generated_output = model(
                     brain=brain,
                     subject_idx=subject_idx,
