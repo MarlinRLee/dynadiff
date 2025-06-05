@@ -311,7 +311,7 @@ class NeuroImagesDataModule(LightningDataModule):
         self.eval_dataset = None # This will be used for validation and testing
 
     def setup(self, stage: tp.Optional[str] = None):
-            all_subjects = [1, 2, 5  ]#, 7
+            all_subjects = [1, 2, 5, 7]
             # Logic to prepare datasets for different stages
             if stage == "fit" or stage is None: # 'fit' is for training
                 print("Preparing training dataset...")

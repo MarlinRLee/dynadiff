@@ -18,22 +18,28 @@ print(f"Using device: {device}")
 @dataclass
 class TrainingConfig:
     subjects: list[int] = field(default_factory=list)
-    learning_rate: float = field(default=1e-4)
-    epochs: int = field(default=10)
-    batch_size: int = field(default=32)
+    learning_rate: float = field(default=1e-3)
+    weight_decay: float = field(default=0.01) # Added weight decay
+    beta1: float = field(default=0.9) # Added beta1
+    beta2: float = field(default=0.999) # Added beta2
+    epochs: int = field(default=10) # This will be overridden by max_training_steps for better control
+    batch_size: int = field(default=40)
+    max_training_steps: int = field(default=60000) # Directly set for 60k steps
+    warmup_steps: int = field(default=1000) # Added for linear warmup
     cache: str = field(default="./cache")
     seed: int = field(default=42)
     vd_cache_dir: str = field(default="./versatile_diffusion")
     checkpoint_dir: str = field(default="./training_checkpoints")
     log_dir: str = field(default="./lightning_logs")
     log_interval: int = field(default=10)
-    accelerator: str = field(default="cuda")
-    devices: int = field(default="auto") 
-    precision: str = field(default="16-mixed")
+    accelerator: str = field(default="cuda") # Typically handled by DeepSpeed directly or Lightning's DeepSpeed strategy
+    devices: int = field(default=8) # Set to 8 A100 GPUs
+    precision: str = field(default="16-mixed") # Set to float16 precision
     num_eval_images: int = field(default=5)
-    eval_freq: int = field(default=1)
+    eval_freq: int = field(default=1) # Evaluate every epoch (or can be changed to steps later)
 
-args = TrainingConfig(subjects = [1,2,5])#,7
+
+args = TrainingConfig(subjects = [1, 2, 5, 7])
 
 pl.seed_everything(args.seed)
 
@@ -107,39 +113,81 @@ for name, param in model.named_parameters():
 # Define optimizer
 trainable_params = model.collect_parameters()
 print(f"Number of trainable parameters: {sum(p.numel() for p in trainable_params)}")
-optimizer = optim.AdamW(trainable_params, lr=args.learning_rate)
+optimizer = optim.AdamW(
+    trainable_params,
+    lr=args.learning_rate,
+    weight_decay=args.weight_decay,
+    betas=(args.beta1, args.beta2)
+)
 print(f"Optimizer: {optimizer}")
+
+total_steps_per_epoch = len(train_dataloader)
+num_epochs_from_steps = args.max_training_steps // total_steps_per_epoch
+if args.max_training_steps % total_steps_per_epoch != 0:
+    num_epochs_from_steps += 1 # Ensure all steps are covered
+print(f"Calculated approximate epochs to reach {args.max_training_steps} steps: {num_epochs_from_steps}")
+
+
+# Learning Rate Scheduler
+def lr_lambda(current_step: int):
+    if current_step < args.warmup_steps:
+        return float(current_step) / float(max(1, args.warmup_steps))
+    progress = float(current_step - args.warmup_steps) / float(max(1, args.max_training_steps - args.warmup_steps))
+    return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+print(f"Learning rate scheduler: {scheduler}")
+
+# For mixed precision training, you would typically use torch.cuda.amp.GradScaler
+# or a framework like DeepSpeed/Lightning.
+scaler = torch.amp.GradScaler(enabled=(args.precision == "16-mixed"))
+
+print("Starting training...")
+global_step = 0
+
 
 print("Starting training...")
 for epoch in range(1, args.epochs + 1):
     model.train()
-    total_train_loss = 0
 
-    
+    if global_step >= args.max_training_steps:
+        print(f"Reached {args.max_training_steps} training steps. Stopping training.")
+        break
+
     for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}/{args.epochs} (Training)")):
+        if global_step >= args.max_training_steps:
+            print(f"Reached {args.max_training_steps} training steps. Stopping training in batch loop.")
+            break
+
         optimizer.zero_grad()
 
         brain = batch["brain"].to(device)
         subject_idx = batch["subject_idx"].to(device)
         img = batch["img"].to(device) # Stimuli given to patient
 
-        # Forward pass: compute outputs and losses
-        model_output = model(
-            brain=brain,
-            subject_idx=subject_idx,
-            img=img,
-            is_img_gen_mode=False,
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(args.precision == "16-mixed")):
+            model_output = model(
+                brain=brain,
+                subject_idx=subject_idx,
+                img=img,
+                is_img_gen_mode=False,
+            )
+
+            current_loss = model_output.losses["diffusion"]
+
+        scaler.scale(current_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        wandb.log(
+            {
+                "train/batch_loss": current_loss.item(),
+                "train/learning_rate": optimizer.param_groups[0]["lr"],
+            },
+            step=global_step
         )
-
-        # Sum up the losses from the model_output
-        current_loss = model_output.losses["diffusion"]
-
-        current_loss.backward()
-
-        # Update model parameters
-        optimizer.step()
-
-        wandb.log({"train/batch_loss": current_loss.item()}, step=(epoch-1)*len(train_dataloader) + batch_idx)
+        global_step += 1
     
     # --- Validation Loop ---
     model.eval()
@@ -201,7 +249,7 @@ for epoch in range(1, args.epochs + 1):
             trues=ground_truth_images,
             device=device
         )
-        wandb.log({f"val/image_metrics/{k}": v for k, v in image_gen_metrics.items()}, "epoch": epoch)
+        wandb.log({f"val/image_metrics/{k}": v for k, v in image_gen_metrics.items()})
         print(f"Epoch {epoch} Image Generation Metrics: {image_gen_metrics}")
         
 
