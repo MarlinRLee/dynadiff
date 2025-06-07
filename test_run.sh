@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --time=12:00:00 # Adjust this to your desired training time (e.g., 2.5 days)
+#SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=30
 #SBATCH --mem=100g
