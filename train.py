@@ -21,7 +21,7 @@ print(f"DeepSpeed is initializing...")
 
 @dataclass
 class TrainingConfig:
-    subjects: list[int] = field(default_factory=list)
+    subjects: list[int] = field(default_factory=lambda: [1,2,5,7])
     cache: str = field(default="./cache")
     seed: int = field(default=42)
     vd_cache_dir: str = field(default="./versatile_diffusion")
@@ -36,16 +36,30 @@ parser = argparse.ArgumentParser(description='DeepSpeed Training Script')
 # DeepSpeed arguments (required to load ds_config.json)
 parser = deepspeed.add_config_arguments(parser)
 
+parser.add_argument('--local_rank', type=int, default=-1,
+                    help='local rank passed from distributed launcher')
+
 args = parser.parse_args()
 
-# Populate TrainingConfig from parsed args
-script_args = TrainingConfig(
-    subjects=[1,2,5,7]
-)
+if torch.cuda.is_available():
+    torch.cuda.set_device(args.local_rank)
+    print(f"Process {args.local_rank}: Set CUDA device to {args.local_rank}")
+else:
+    print(f"CUDA not available. Running on CPU (Process {args.local_rank})")
+
+deepspeed.init_distributed(dist_backend='nccl')
+
+script_args = TrainingConfig()
 
 # Only seed on rank 0, DeepSpeed handles distributed seeding internally
 if deepspeed.comm.get_rank() == 0:
-    pl.seed_everything(script_args.seed)
+    print(f"DeepSpeed is initializing for global rank {deepspeed.comm.get_rank()}...")
+    pl.seed_everything(script_args.seed) # Only seed once per global rank 0
+    print(f"Global rank 0: Seeding everything with seed {script_args.seed}")
+
+    # Initialize Weights & Biases only on global rank 0
+    wandb.init(project="versatile-diffusion-fmri", config=vars(script_args)) # versatile-diffusion-fmri
+    print(f"Global rank 0: Initialized Weights & Biases.")
 
 
 cfg = get_cfg(
@@ -67,53 +81,57 @@ data_module_config = NeuroImagesDataModuleConfig(**cfg['data'])
 data_module = data_module_config.build()
 
 train_dataloader = data_module.train_dataloader()
-print(f"Training dataset size: {len(data_module.train_dataset)} samples.")
-print(f"Number of training batches: {len(train_dataloader)}")
+if deepspeed.comm.get_rank() == 0: # Only print from rank 0
+    print(f"Training dataset size: {len(data_module.train_dataset)} samples.")
+    print(f"Number of training batches: {len(train_dataloader)}")
 
 val_dataloader = data_module.val_dataloader()
-print(f"Validation dataset size: {len(data_module.eval_dataset)} samples.")
-print(f"Number of validation batches: {len(val_dataloader)}")
+if deepspeed.comm.get_rank() == 0: # Only print from rank 0
+    print(f"Validation dataset size: {len(data_module.eval_dataset)} samples.")
+    print(f"Number of validation batches: {len(val_dataloader)}")
 
-sample_brain_input = data_module.eval_dataset[0]["brain"]
-brain_n_in_channels, brain_temp_dim = sample_brain_input.size()
-print(f"Brain input dimensions: {brain_n_in_channels} channels, {brain_temp_dim} temporal dimension.")
+
+if deepspeed.comm.get_rank() == 0: # Only print from rank 0
+    sample_brain_input = data_module.eval_dataset[0]["brain"]
+    brain_n_in_channels, brain_temp_dim = sample_brain_input.size()
+    print(f"Brain input dimensions: {brain_n_in_channels} channels, {brain_temp_dim} temporal dimension.")
 
 print("Instantiating model...")
 vd_config = VersatileDiffusionConfig(**cfg['versatilediffusion_config'])
 
 model = VersatileDiffusion(
     config=vd_config,
-    brain_n_in_channels=brain_n_in_channels,
-    brain_temp_dim=brain_temp_dim,
-    lora_rank=4,
-    lora_alpha=4,
+    brain_n_in_channels=16724,#make sure these match the sample ones
+    brain_temp_dim=6
 )
 
 trainable_params = model.collect_parameters()
 
 # Initialize DeepSpeed - pass the `args` object from argparse, which contains ds_config path
 model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
-    args=args,
+    args=args, # Pass the parsed args object; DeepSpeed will extract its config path
     model=model,
     model_parameters=trainable_params,
     training_data=data_module.train_dataset
 )
 
 if deepspeed.comm.get_rank() == 0:
-    for name, param in model_engine.named_parameters():
-        if param.requires_grad:
-            print(f"Trainable (DeepSpeed): {name}, Shape: {param.shape}")
+    # for name, param in model_engine.named_parameters():
+    #     if param.requires_grad:
+    #         print(f"Trainable (DeepSpeed): {name}, Shape: {param.shape}")
     print(f"Number of trainable parameters (DeepSpeed): {sum(p.numel() for p in model_engine.parameters() if p.requires_grad)}")
     print(f"DeepSpeed Optimizer: {optimizer}")
 
 # Get total_num_steps and micro_batch_size_per_gpu from DeepSpeed engine for local loop logic/logging
-max_training_steps = model_engine.scheduler.total_num_steps # Get from scheduler
+max_training_steps = lr_scheduler.total_num_steps # Get from scheduler
 
 # Calculate epochs based on DeepSpeed's steps
 total_steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 num_epochs_from_steps = max_training_steps // total_steps_per_epoch
+
 if max_training_steps % total_steps_per_epoch != 0:
     num_epochs_from_steps += 1
+
 if deepspeed.comm.get_rank() == 0:
     print(f"Calculated approximate epochs to reach {max_training_steps} steps: {num_epochs_from_steps}")
 
@@ -130,6 +148,8 @@ for epoch in range(1, num_epochs_from_steps + 1):
         subject_idx = batch["subject_idx"].to(model_engine.device)
         img = batch["img"].to(model_engine.device)
 
+        brain = brain.half()
+
         model_output = model_engine(
             brain=brain,
             subject_idx=subject_idx,
@@ -142,10 +162,6 @@ for epoch in range(1, num_epochs_from_steps + 1):
         model_engine.backward(current_loss)
         model_engine.step()
 
-        if deepspeed.comm.get_rank() == 0:
-            wandb.log({
-                "train/batch_loss": current_loss.item(),
-            }, step=global_step)
         global_step += 1
 
     # --- Validation Loop ---
@@ -160,6 +176,7 @@ for epoch in range(1, num_epochs_from_steps + 1):
                 brain = batch["brain"].to(model_engine.device)
                 subject_idx = batch["subject_idx"].to(model_engine.device)
                 img = batch["img"].to(model_engine.device)
+                brain = brain.half()
 
                 model_output = model_engine(
                     brain=brain,

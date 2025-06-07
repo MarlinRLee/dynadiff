@@ -14,10 +14,10 @@
   "scheduler": {
     "type": "WarmupCosineLR",
     "params": {
-      "warmup_min_lr": 0,
-      "warmup_max_lr": 1e-3,
+      "warmup_min_ratio": 0.0, 
       "warmup_num_steps": 1000,
-      "total_num_steps": 60000
+      "total_num_steps": 60000,
+      "cos_min_ratio": 0.0001 
     }
   },
   "fp16": {

@@ -203,19 +203,13 @@ class NsdDatasetConfig(pydantic.BaseModel):
             subject_cache_dir = processed_data_root_path / f"subj{sub_id:02d}" / self.dataset_split
             os.makedirs(subject_cache_dir, exist_ok=True)
 
-            print(f"Starting parallel processing for subject {sub_id} with {len(sub_events)} events...")
-            # Use a ProcessPoolExecutor for CPU-bound tasks
             with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-                # Pass subject_cache_dir as an argument to the worker function
                 futures = [executor.submit(self._process_single_event, event, subject_cache_dir) for event in sub_events]
 
 
                 for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
                     all_results.append(future.result())
 
-        # The original infra.apply expects an iterator for processing, but if we're doing it all at once
-        # with multiprocessing, we return the collected list as an iterator.
-        # This also implicitly handles the `infra.apply`'s internal caching if configured.
         return iter(all_results)
 
 
@@ -226,14 +220,9 @@ class NsdDatasetConfig(pydantic.BaseModel):
         subject_id_map = {sub_id: i for i, sub_id in enumerate(self.subject_ids)}
 
         for sub_id in self.subject_ids:
-            print(f"Generating event list for subject {sub_id}...")
             subject_events = self.create_event_list(subject_id=sub_id)
-            print(f"Processing and caching data for subject {sub_id}...")
-
 
             data = self.prepare(subject_events)
-
-
 
             processed_event_info = list(data) # Collect all yielded results
 

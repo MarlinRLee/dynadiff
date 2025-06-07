@@ -14,3 +14,4 @@ processed_nsd_data/
 Train_Pipeline.ipynb
 training_checkpoints/
 versatile_diffusion/
+wandb/
