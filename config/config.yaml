@@ -33,22 +33,22 @@ data:
   # test_groupbyimg: averaged
   workers: 10
 infra:
-  cluster: null
+  cluster: slurm 
   conda_env: null
-  cpus_per_task: 10
+  cpus_per_task: 30
   folder: ./cache
-  gpus_per_node: null
+  gpus_per_node: 2
   job_name: dynadiff
   keep_in_ram: false
   logs: '{folder}/logs/{user}/%j'
-  mem_gb: null
+  mem_gb: 100
   mode: force
   permissions: 511
   slurm_additional_parameters: null
   slurm_constraint: null
   slurm_partition: null
   slurm_use_srun: false
-  timeout_min: 4320
+  timeout_min: 720
   version: '1'
   workdir: null
 seed: 33

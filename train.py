@@ -53,13 +53,9 @@ script_args = TrainingConfig()
 
 # Only seed on rank 0, DeepSpeed handles distributed seeding internally
 if deepspeed.comm.get_rank() == 0:
-    print(f"DeepSpeed is initializing for global rank {deepspeed.comm.get_rank()}...")
-    pl.seed_everything(script_args.seed) # Only seed once per global rank 0
-    print(f"Global rank 0: Seeding everything with seed {script_args.seed}")
-
-    # Initialize Weights & Biases only on global rank 0
+    pl.seed_everything(script_args.seed)
     wandb.init(project="versatile-diffusion-fmri", config=vars(script_args)) # versatile-diffusion-fmri
-    print(f"Global rank 0: Initialized Weights & Biases.")
+
 
 
 cfg = get_cfg(
