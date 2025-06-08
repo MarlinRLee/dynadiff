@@ -49,5 +49,6 @@
   "wandb": {
     "enabled": true,
     "project": "versatile-diffusion-fmri"
-  }
+  },
+  "dist_backend_timeout": 1800000
 }

@@ -23,6 +23,8 @@ export PATH="/common/software/install/migrated/gcc/9.2.0/bin:$PATH"
 # Explicitly add the newer GCC's lib64 directory to LD_LIBRARY_PATH.
 export LD_LIBRARY_PATH="/common/software/install/migrated/gcc/9.2.0/lib64:$LD_LIBRARY_PATH"
 
+export TRITON_CACHE_DIR="/scratch.local/lee02328/.triton_cache"
+
 source /home/boleydl/lee02328/miniconda3/etc/profile.d/conda.sh
 conda activate dynadiff5
 

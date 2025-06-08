@@ -41,11 +41,11 @@ parser.add_argument('--local_rank', type=int, default=-1,
 
 args = parser.parse_args()
 
-if torch.cuda.is_available():
-    torch.cuda.set_device(args.local_rank)
-    print(f"Process {args.local_rank}: Set CUDA device to {args.local_rank}")
-else:
-    print(f"CUDA not available. Running on CPU (Process {args.local_rank})")
+# if torch.cuda.is_available():
+#     torch.cuda.set_device(args.local_rank)
+#     print(f"Process {args.local_rank}: Set CUDA device to {args.local_rank}")
+# else:
+#     print(f"CUDA not available. Running on CPU (Process {args.local_rank})")
 
 deepspeed.init_distributed(dist_backend='nccl')
 
@@ -103,12 +103,12 @@ model = VersatileDiffusion(
 
 trainable_params = model.collect_parameters()
 
-# Initialize DeepSpeed - pass the `args` object from argparse, which contains ds_config path
-model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
-    args=args, # Pass the parsed args object; DeepSpeed will extract its config path
+
+model_engine, optimizer, deepspeed_dataloader, lr_scheduler = deepspeed.initialize(
+    args=args,
     model=model,
     model_parameters=trainable_params,
-    training_data=data_module.train_dataset
+    training_data=train_dataset 
 )
 
 if deepspeed.comm.get_rank() == 0:
@@ -117,12 +117,14 @@ if deepspeed.comm.get_rank() == 0:
     #         print(f"Trainable (DeepSpeed): {name}, Shape: {param.shape}")
     print(f"Number of trainable parameters (DeepSpeed): {sum(p.numel() for p in model_engine.parameters() if p.requires_grad)}")
     print(f"DeepSpeed Optimizer: {optimizer}")
+    print(f"DeepSpeed DataLoader batch size: {deepspeed_dataloader.batch_size}")
+
 
 # Get total_num_steps and micro_batch_size_per_gpu from DeepSpeed engine for local loop logic/logging
 max_training_steps = lr_scheduler.total_num_steps # Get from scheduler
 
 # Calculate epochs based on DeepSpeed's steps
-total_steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
+total_steps_per_epoch = len(deepspeed_dataloader) // model_engine.gradient_accumulation_steps()
 num_epochs_from_steps = max_training_steps // total_steps_per_epoch
 
 if max_training_steps % total_steps_per_epoch != 0:
@@ -133,18 +135,17 @@ if deepspeed.comm.get_rank() == 0:
 
 
 print("Starting training...")
-global_step = 0
 for epoch in range(1, num_epochs_from_steps + 1):
     model_engine.train()
     total_train_loss = 0
 
-    for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch}/{num_epochs_from_steps} (Training)", disable=(deepspeed.comm.get_rank() != 0))):
+    for batch_idx, batch in enumerate(tqdm(deepspeed_dataloader, desc=f"Epoch {epoch}/{num_epochs_from_steps} (Training)", disable=(deepspeed.comm.get_rank() != 0))):
 
         brain = batch["brain"].to(model_engine.device)
         subject_idx = batch["subject_idx"].to(model_engine.device)
         img = batch["img"].to(model_engine.device)
 
-        brain = brain.half()
+        #brain = brain.half()
 
         model_output = model_engine(
             brain=brain,
@@ -157,8 +158,6 @@ for epoch in range(1, num_epochs_from_steps + 1):
 
         model_engine.backward(current_loss)
         model_engine.step()
-
-        global_step += 1
 
     # --- Validation Loop ---
     if deepspeed.comm.get_rank() == 0:
@@ -184,9 +183,9 @@ for epoch in range(1, num_epochs_from_steps + 1):
                 current_val_loss = model_output.losses["diffusion"]
                 total_val_loss += current_val_loss.item()
 
-                if (epoch % script_args.eval_freq == 0 or epoch == num_epochs_from_steps) and model_engine.train_micro_batch_size_per_gpu() * batch_idx < script_args.num_eval_images:
+                if (epoch % script_args.eval_freq == 0 or epoch == num_epochs_from_steps) and batch_idx == 0:
                     generated_output = model_engine(
-                        brain=brain,
+                        brain=brain[:script_args.num_eval_images],
                         subject_idx=subject_idx,
                         is_img_gen_mode=True,
                     )
@@ -207,18 +206,18 @@ for epoch in range(1, num_epochs_from_steps + 1):
 
         avg_epoch_val_loss = total_val_loss / len(val_dataloader)
 
-        wandb.log({"val/epoch_loss": avg_epoch_val_loss, "epoch": epoch, "global_step": global_step})
+        wandb.log({"val/epoch_loss": avg_epoch_val_loss})
         if (epoch % script_args.eval_freq == 0 or epoch == num_epochs_from_steps):
-            wandb.log({"val/generated_vs_ground_truth_images": wandb_images, "epoch": epoch, "global_step": global_step})
+            wandb.log({"val/generated_vs_ground_truth_images": wandb_images})
 
-            print("Computing image generation metrics...")
-            image_gen_metrics = compute_image_generation_metrics(
-                preds=generated_images,
-                trues=ground_truth_images,
-                device=model_engine.device
-            )
-            wandb.log({f"val/image_metrics/{k}": v for k, v in image_gen_metrics.items()}, step=global_step)
-            print(f"Epoch {epoch} Image Generation Metrics: {image_gen_metrics}")
+            #print("Computing image generation metrics...")
+            #image_gen_metrics = compute_image_generation_metrics(
+            #    preds=generated_images,
+            #    trues=ground_truth_images,
+            #    device=model_engine.device
+            #)
+            #wandb.log({f"val/image_metrics/{k}": v for k, v in image_gen_metrics.items()})
+            #print(f"Epoch {epoch} Image Generation Metrics: {image_gen_metrics}")
 
         model_engine.save_checkpoint(script_args.checkpoint_dir, epoch)
         print(f"Saved DeepSpeed checkpoint for epoch {epoch} to {script_args.checkpoint_dir}")
