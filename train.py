@@ -31,6 +31,7 @@ class TrainingConfig:
     num_eval_images: int = field(default=5)
     log_image_freq: int = field(default=1)
     compute_metrics_freq: int = field(default=5)
+    num_metric_batches : int = field(default=10)
 
 # --- Argument Parsing (Minimal for DeepSpeed and your specific script args) ---
 parser = argparse.ArgumentParser(description='DeepSpeed Training Script')
@@ -166,8 +167,8 @@ for epoch in range(1, num_epochs_from_steps + 1):#change to 1 once I know model 
     wandb_images = []
 
 
-    is_metrics_epoch = (epoch % script_args.compute_metrics_freq == 0) or (epoch == num_epochs_from_steps)
-    is_log_image_epoch = (epoch % script_args.log_image_freq == 0) or (epoch == num_epochs_from_steps)
+    is_metrics_epoch = (epoch % script_args.compute_metrics_freq == 0) or (epoch == num_epochs_from_steps) or (epoch == 1)
+    is_log_image_epoch = (epoch % script_args.log_image_freq == 0) or (epoch == num_epochs_from_steps) or (epoch == 1)
     with torch.no_grad():
         val_pbar = tqdm(val_dataloader, desc=f"Epoch {epoch} (Validation)", disable=(deepspeed.comm.get_rank() != 0))
         for batch_idx, batch in enumerate(val_pbar):
@@ -185,7 +186,7 @@ for epoch in range(1, num_epochs_from_steps + 1):#change to 1 once I know model 
             current_val_loss = model_output.losses["diffusion"]
             total_val_loss_tensor += current_val_loss
             #log_image_freq, compute_metrics_freq
-            if is_metrics_epoch or (is_log_image_epoch and batch_idx == 0):
+            if (is_metrics_epoch and batch_idx < script_args.num_metric_batches) or (is_log_image_epoch and batch_idx == 0):
                 generated_output = model_engine(
                     brain=brain,
                     subject_idx=subject_idx,
@@ -196,7 +197,7 @@ for epoch in range(1, num_epochs_from_steps + 1):#change to 1 once I know model 
                 gen_pil_list = [Image.fromarray(arr) for arr in gen_batch_np]
                 gt_pil_list = [Image.fromarray(arr) for arr in gt_batch_np]
                 # If calculating metrics for the whole dataset, each rank collects its own images.
-                if is_metrics_epoch:
+                if (is_metrics_epoch and batch_idx < script_args.num_metric_batches):
                     local_generated_images.extend(gen_pil_list)
                     local_ground_truth_images.extend(gt_pil_list)
 
@@ -232,6 +233,7 @@ for epoch in range(1, num_epochs_from_steps + 1):#change to 1 once I know model 
         avg_epoch_val_loss = total_val_loss_tensor.item() / num_val_samples
         print(f"Epoch {epoch} | Average Validation Loss: {avg_epoch_val_loss}")
         wandb.log({"val/epoch_loss": avg_epoch_val_loss, "epoch": epoch})
+        
         if is_log_image_epoch:
                 wandb.log({"val/generated_vs_ground_truth_images": wandb_images, "epoch": epoch})
 

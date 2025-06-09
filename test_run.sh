@@ -26,7 +26,7 @@ export LD_LIBRARY_PATH="/common/software/install/migrated/gcc/9.2.0/lib64:$LD_LI
 export TRITON_CACHE_DIR="/scratch.local/lee02328/.triton_cache"
 
 #export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
-#export NCCL_TIMEOUT=3600s
+export NCCL_TIMEOUT=3600s
 #export NCCL_DEBUG=INFO
 #export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_DEBUG=WARN
