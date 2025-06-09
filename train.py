@@ -32,6 +32,7 @@ class TrainingConfig:
     log_image_freq: int = field(default=1)
     compute_metrics_freq: int = field(default=5)
     num_metric_batches : int = field(default=10)
+    resume_from_checkpoint: bool = field(default=True, metadata={"help": "Resume training from the last checkpoint."})
 
 # --- Argument Parsing (Minimal for DeepSpeed and your specific script args) ---
 parser = argparse.ArgumentParser(description='DeepSpeed Training Script')
@@ -111,6 +112,17 @@ model_engine, optimizer, deepspeed_dataloader, lr_scheduler = deepspeed.initiali
     training_data=data_module.train_dataset 
 )
 
+start_epoch = 1
+if script_args.resume_from_checkpoint:
+    load_path, client_sd = model_engine.load_checkpoint(script_args.checkpoint_dir, load_module_strict=False)
+    if load_path is None:
+        print(f"Could not find a checkpoint to resume from in {script_args.checkpoint_dir}, starting from scratch.")
+    else:
+        # The load_checkpoint function returns a dictionary with metadata.
+        # 'epoch' is a common key, but check what your saving logic provides.
+        start_epoch = client_sd.get('epoch', 1) + 1
+        print(f"Resuming training from epoch {start_epoch}")
+
 if deepspeed.comm.get_rank() == 0:
     # for name, param in model_engine.named_parameters():
     #     if param.requires_grad:
@@ -186,10 +198,12 @@ for epoch in range(1, num_epochs_from_steps + 1):#change to 1 once I know model 
             current_val_loss = model_output.losses["diffusion"]
             total_val_loss_tensor += current_val_loss
             #log_image_freq, compute_metrics_freq
-            if (is_metrics_epoch and batch_idx < script_args.num_metric_batches) or (is_log_image_epoch and batch_idx == 0):
+            if (is_metrics_epoch and batch_idx < script_args.num_metric_batches) or\
+                (is_log_image_epoch and batch_idx == 0 and deepspeed.comm.get_rank() == 0):
                 generated_output = model_engine(
                     brain=brain,
                     subject_idx=subject_idx,
+                    img=img,
                     is_img_gen_mode=True,
                 )
                 gen_batch_np = (generated_output.image.permute(0, 2, 3, 1) * 255.0).to(torch.uint8).cpu().numpy()
