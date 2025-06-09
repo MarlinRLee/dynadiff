@@ -1,8 +1,8 @@
 #!/bin/bash -l
 #SBATCH --time=12:00:00
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=30
-#SBATCH --mem=100g
+#SBATCH --ntasks=2
+#SBATCH --cpus-per-task=15
+#SBATCH --mem=80g
 #SBATCH --tmp=30g
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=lee02328@umn.edu
@@ -25,8 +25,14 @@ export LD_LIBRARY_PATH="/common/software/install/migrated/gcc/9.2.0/lib64:$LD_LI
 
 export TRITON_CACHE_DIR="/scratch.local/lee02328/.triton_cache"
 
+#export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
+#export NCCL_TIMEOUT=3600s
+#export NCCL_DEBUG=INFO
+#export NCCL_DEBUG_SUBSYS=ALL
+export NCCL_DEBUG=WARN
+
 source /home/boleydl/lee02328/miniconda3/etc/profile.d/conda.sh
 conda activate dynadiff5
 
 # Your DeepSpeed training command
-deepspeed --num_gpus=2 train.py --deepspeed_config ds_config.json
+deepspeed train.py --deepspeed_config ds_config.json

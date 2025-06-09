@@ -29,7 +29,8 @@ class TrainingConfig:
     log_dir: str = field(default="./lightning_logs")
     log_interval: int = field(default=10)
     num_eval_images: int = field(default=5)
-    eval_freq: int = field(default=1)
+    log_image_freq: int = field(default=1)
+    compute_metrics_freq: int = field(default=5)
 
 # --- Argument Parsing (Minimal for DeepSpeed and your specific script args) ---
 parser = argparse.ArgumentParser(description='DeepSpeed Training Script')
@@ -41,11 +42,11 @@ parser.add_argument('--local_rank', type=int, default=-1,
 
 args = parser.parse_args()
 
-# if torch.cuda.is_available():
-#     torch.cuda.set_device(args.local_rank)
-#     print(f"Process {args.local_rank}: Set CUDA device to {args.local_rank}")
-# else:
-#     print(f"CUDA not available. Running on CPU (Process {args.local_rank})")
+if torch.cuda.is_available():
+    torch.cuda.set_device(args.local_rank)
+    print(f"INFO: Rank {args.local_rank} is setting device to torch.cuda.current_device(): {torch.cuda.current_device()}")
+else:
+    print("WARNING: CUDA not available, running on CPU.")
 
 deepspeed.init_distributed(dist_backend='nccl')
 
@@ -67,8 +68,10 @@ cfg = get_cfg(
     custom_infra=None,
 )
 
-os.makedirs(script_args.checkpoint_dir, exist_ok=True)
-os.makedirs(script_args.log_dir, exist_ok=True)
+if deepspeed.comm.get_rank() == 0:
+    os.makedirs(script_args.checkpoint_dir, exist_ok=True)
+    os.makedirs(script_args.log_dir, exist_ok=True)
+    
 print(f"Saving checkpoints to: {script_args.checkpoint_dir}")
 print(f"Logging to: {script_args.log_dir}")
 
@@ -76,10 +79,6 @@ print("Preparing data info for ALL subjects...")
 data_module_config = NeuroImagesDataModuleConfig(**cfg['data'])
 data_module = data_module_config.build()
 
-train_dataloader = data_module.train_dataloader()
-if deepspeed.comm.get_rank() == 0: # Only print from rank 0
-    print(f"Training dataset size: {len(data_module.train_dataset)} samples.")
-    print(f"Number of training batches: {len(train_dataloader)}")
 
 val_dataloader = data_module.val_dataloader()
 if deepspeed.comm.get_rank() == 0: # Only print from rank 0
@@ -87,9 +86,9 @@ if deepspeed.comm.get_rank() == 0: # Only print from rank 0
     print(f"Number of validation batches: {len(val_dataloader)}")
 
 
+sample_brain_input = data_module.eval_dataset[0]["brain"]
+brain_n_in_channels, brain_temp_dim = sample_brain_input.size()
 if deepspeed.comm.get_rank() == 0: # Only print from rank 0
-    sample_brain_input = data_module.eval_dataset[0]["brain"]
-    brain_n_in_channels, brain_temp_dim = sample_brain_input.size()
     print(f"Brain input dimensions: {brain_n_in_channels} channels, {brain_temp_dim} temporal dimension.")
 
 print("Instantiating model...")
@@ -97,8 +96,8 @@ vd_config = VersatileDiffusionConfig(**cfg['versatilediffusion_config'])
 
 model = VersatileDiffusion(
     config=vd_config,
-    brain_n_in_channels=16724,#make sure these match the sample ones
-    brain_temp_dim=6
+    brain_n_in_channels = brain_n_in_channels,#make sure these match the sample ones
+    brain_temp_dim = brain_temp_dim
 )
 
 trainable_params = model.collect_parameters()
@@ -108,7 +107,7 @@ model_engine, optimizer, deepspeed_dataloader, lr_scheduler = deepspeed.initiali
     args=args,
     model=model,
     model_parameters=trainable_params,
-    training_data=train_dataset 
+    training_data=data_module.train_dataset 
 )
 
 if deepspeed.comm.get_rank() == 0:
@@ -135,17 +134,16 @@ if deepspeed.comm.get_rank() == 0:
 
 
 print("Starting training...")
-for epoch in range(1, num_epochs_from_steps + 1):
+for epoch in range(1, num_epochs_from_steps + 1):#change to 1 once I know model saving works
     model_engine.train()
     total_train_loss = 0
 
     for batch_idx, batch in enumerate(tqdm(deepspeed_dataloader, desc=f"Epoch {epoch}/{num_epochs_from_steps} (Training)", disable=(deepspeed.comm.get_rank() != 0))):
-
         brain = batch["brain"].to(model_engine.device)
         subject_idx = batch["subject_idx"].to(model_engine.device)
         img = batch["img"].to(model_engine.device)
 
-        #brain = brain.half()
+        brain = brain.half()
 
         model_output = model_engine(
             brain=brain,
@@ -159,68 +157,100 @@ for epoch in range(1, num_epochs_from_steps + 1):
         model_engine.backward(current_loss)
         model_engine.step()
 
-    # --- Validation Loop ---
-    if deepspeed.comm.get_rank() == 0:
-        model_engine.eval()
-        total_val_loss = 0
-        generated_images = []
-        ground_truth_images = []
-        wandb_images = []
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(val_dataloader, desc=f"Epoch {epoch}/{num_epochs_from_steps} (Validation)")):
-                brain = batch["brain"].to(model_engine.device)
-                subject_idx = batch["subject_idx"].to(model_engine.device)
-                img = batch["img"].to(model_engine.device)
-                brain = brain.half()
+    # --- Validation Loop --
+    torch.distributed.barrier()
+    model_engine.eval()
+    total_val_loss_tensor = torch.tensor(0.0).to(model_engine.device)
+    local_generated_images = []
+    local_ground_truth_images = []
+    wandb_images = []
 
-                model_output = model_engine(
+
+    is_metrics_epoch = (epoch % script_args.compute_metrics_freq == 0) or (epoch == num_epochs_from_steps)
+    is_log_image_epoch = (epoch % script_args.log_image_freq == 0) or (epoch == num_epochs_from_steps)
+    with torch.no_grad():
+        val_pbar = tqdm(val_dataloader, desc=f"Epoch {epoch} (Validation)", disable=(deepspeed.comm.get_rank() != 0))
+        for batch_idx, batch in enumerate(val_pbar):
+            brain = batch["brain"].to(model_engine.device).half()
+            subject_idx = batch["subject_idx"].to(model_engine.device)
+            img = batch["img"].to(model_engine.device)
+
+            model_output = model_engine(
+                brain=brain,
+                subject_idx=subject_idx,
+                img=img,
+                is_img_gen_mode=False,
+            )
+
+            current_val_loss = model_output.losses["diffusion"]
+            total_val_loss_tensor += current_val_loss
+            #log_image_freq, compute_metrics_freq
+            if is_metrics_epoch or (is_log_image_epoch and batch_idx == 0):
+                generated_output = model_engine(
                     brain=brain,
                     subject_idx=subject_idx,
-                    img=img,
-                    is_img_gen_mode=False,
+                    is_img_gen_mode=True,
                 )
+                gen_batch_np = (generated_output.image.permute(0, 2, 3, 1) * 255.0).to(torch.uint8).cpu().numpy()
+                gt_batch_np = (img.permute(0, 2, 3, 1) * 255.0).to(torch.uint8).cpu().numpy()
+                gen_pil_list = [Image.fromarray(arr) for arr in gen_batch_np]
+                gt_pil_list = [Image.fromarray(arr) for arr in gt_batch_np]
+                # If calculating metrics for the whole dataset, each rank collects its own images.
+                if is_metrics_epoch:
+                    local_generated_images.extend(gen_pil_list)
+                    local_ground_truth_images.extend(gt_pil_list)
 
-                current_val_loss = model_output.losses["diffusion"]
-                total_val_loss += current_val_loss.item()
+                # If logging images, only rank 0 prepares its first batch for wandb.
+                if deepspeed.comm.get_rank() == 0 and (is_log_image_epoch and batch_idx == 0):
+                    for i, (gen_pil, gt_pil) in enumerate(zip(gen_pil_list, gt_pil_list)):
+                        wandb_images.append(wandb.Image(gen_pil, caption=f"Generated Image Batch {batch_idx+1}, Image {i+1} (Epoch {epoch})"))
+                        wandb_images.append(wandb.Image(gt_pil, caption=f"Ground Truth Image Batch {batch_idx+1}, Image {i+1} (Epoch {epoch})"))
 
-                if (epoch % script_args.eval_freq == 0 or epoch == num_epochs_from_steps) and batch_idx == 0:
-                    generated_output = model_engine(
-                        brain=brain[:script_args.num_eval_images],
-                        subject_idx=subject_idx,
-                        is_img_gen_mode=True,
-                    )
-                    for i in range(generated_output.image.shape[0]):
-                        gen_img_tensor = generated_output.image[i].cpu()
-                        gen_img_np = (gen_img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                        gen_pil_img = Image.fromarray(gen_img_np)
 
-                        gt_img_tensor = img[i].cpu() # Assuming 'img' is your ground truth batch tensor
-                        gt_img_np = (gt_img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                        gt_pil_img = Image.fromarray(gt_img_np)
 
-                        generated_images.append(gen_pil_img)
-                        ground_truth_images.append(gt_pil_img)
+    torch.distributed.all_reduce(total_val_loss_tensor, op=torch.distributed.ReduceOp.SUM)
 
-                        wandb_images.append(wandb.Image(gen_pil_img, caption=f"Generated Image Batch {batch_idx+1}, Image {i+1} (Epoch {epoch})"))
-                        wandb_images.append(wandb.Image(gt_pil_img, caption=f"Ground Truth Image Batch {batch_idx+1}, Image {i+1} (Epoch {epoch})"))
+    final_generated_images = []
+    final_ground_truth_images = []
 
-        avg_epoch_val_loss = total_val_loss / len(val_dataloader)
+    if is_metrics_epoch:
+        gathered_gen_images = [None] * deepspeed.comm.get_world_size()
+        gathered_gt_images = [None] * deepspeed.comm.get_world_size()
 
-        wandb.log({"val/epoch_loss": avg_epoch_val_loss})
-        if (epoch % script_args.eval_freq == 0 or epoch == num_epochs_from_steps):
-            wandb.log({"val/generated_vs_ground_truth_images": wandb_images})
+        torch.distributed.gather_object(local_generated_images, gathered_gen_images if deepspeed.comm.get_rank() == 0 else None, dst=0)
+        torch.distributed.gather_object(local_ground_truth_images, gathered_gt_images if deepspeed.comm.get_rank() == 0 else None, dst=0)
 
-            #print("Computing image generation metrics...")
-            #image_gen_metrics = compute_image_generation_metrics(
-            #    preds=generated_images,
-            #    trues=ground_truth_images,
-            #    device=model_engine.device
-            #)
-            #wandb.log({f"val/image_metrics/{k}": v for k, v in image_gen_metrics.items()})
-            #print(f"Epoch {epoch} Image Generation Metrics: {image_gen_metrics}")
+        if deepspeed.comm.get_rank() == 0:
+            # On rank 0, flatten the list of lists into a single list for metrics.
+            final_generated_images = [item for sublist in gathered_gen_images for item in sublist]
+            final_ground_truth_images = [item for sublist in gathered_gt_images for item in sublist]
 
-        model_engine.save_checkpoint(script_args.checkpoint_dir, epoch)
-        print(f"Saved DeepSpeed checkpoint for epoch {epoch} to {script_args.checkpoint_dir}")
+
+
+    if deepspeed.comm.get_rank() == 0:
+        num_val_samples = len(data_module.eval_dataset)
+        avg_epoch_val_loss = total_val_loss_tensor.item() / num_val_samples
+        print(f"Epoch {epoch} | Average Validation Loss: {avg_epoch_val_loss}")
+        wandb.log({"val/epoch_loss": avg_epoch_val_loss, "epoch": epoch})
+        if is_log_image_epoch:
+                wandb.log({"val/generated_vs_ground_truth_images": wandb_images, "epoch": epoch})
+
+        if is_metrics_epoch:
+            if not final_generated_images:
+                print("Warning: Metrics epoch but no images were generated/gathered.")
+            else:
+                image_gen_metrics = compute_image_generation_metrics(
+                    preds=final_generated_images,
+                    trues=final_ground_truth_images,
+                    device=model_engine.device
+                )
+                wandb.log({f"val/image_metrics/{k}": v for k, v in image_gen_metrics.items()}, step=epoch)
+                print(f"Epoch {epoch} Image Generation Metrics: {image_gen_metrics}")
+
+    
+    model_engine.save_checkpoint(script_args.checkpoint_dir, epoch)
+
+    torch.distributed.barrier()
 
 if deepspeed.comm.get_rank() == 0:
     print("Training complete!")

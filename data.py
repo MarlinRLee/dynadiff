@@ -24,6 +24,8 @@ import concurrent.futures
 import multiprocessing
 from tqdm.auto import tqdm
 import torch.nn.functional as F
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 TR_s = 4 / 3
 
@@ -40,7 +42,10 @@ class NsdDataset(torch.utils.data.Dataset):
 
         # Load preprocessed data from .npy files
         fmri = torch.from_numpy(np.load(data_info["fmri_path"])).float()
-        image = torch.from_numpy(np.load(data_info["image_path"])).long().permute(2, 0, 1) / 255.0
+
+        image_np = np.load(data_info["image_path"]).astype(np.float32) / 255.0
+        image = torch.from_numpy(image_np).permute(2, 0, 1)
+
         subject_id = torch.tensor(data_info["subject_idx"], dtype=torch.long)
 
         current_features, current_timepoints = fmri.shape
@@ -303,13 +308,13 @@ class NeuroImagesDataModule(LightningDataModule):
             all_subjects = [1, 2, 5, 7]
             # Logic to prepare datasets for different stages
             if stage == "fit" or stage is None: # 'fit' is for training
-                print("Preparing training dataset...")
+                #print("Preparing training dataset...")
                 # Modify the config for training
                 train_config = self.nsd_dataset_config.copy(
                     update={"subject_ids": all_subjects, "averaged": False, "dataset_split": "train"}
                 )
                 self.train_dataset = train_config.build()
-                print(f"Number of samples in training dataset across all subjects: {len(self.train_dataset)}")
+                #print(f"Number of samples in training dataset across all subjects: {len(self.train_dataset)}")
             if stage == "validate" or stage == "test" or stage is None:
                     # Create a config for validation/test data (e.g., using test split for all subjects)
                     eval_config = self.nsd_dataset_config.copy(
@@ -320,25 +325,28 @@ class NeuroImagesDataModule(LightningDataModule):
                     elif self.test_groupbyimg == "unaveraged":
                         eval_config.averaged = False
                     self.eval_dataset = eval_config.build()
-                    print(f"Number of samples in evaluation/test dataset across all subjects: {len(self.eval_dataset)}")
+                    #print(f"Number of samples in evaluation/test dataset across all subjects: {len(self.eval_dataset)}")
 
 
     def train_dataloader(self):
+        sampler = DistributedSampler(self.train_dataset, shuffle=True)
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.workers,
             pin_memory=self.pin_memory,
-            shuffle=True,
-            drop_last=True, 
+            sampler=sampler,
+            drop_last=True,
         )
 
     def val_dataloader(self):
+        sampler = DistributedSampler(self.eval_dataset, shuffle=False)
         return DataLoader(
-            self.eval_dataset, 
+            self.eval_dataset,
             batch_size=self.batch_size,
             num_workers=self.workers,
             pin_memory=self.pin_memory,
+            sampler=sampler,
             drop_last=False,
         )
 
