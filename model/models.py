@@ -5,9 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import typing as tp
-from functools import partial
-from typing import List
-
 import pydantic
 import torch
 import torch.nn as nn
@@ -19,17 +16,22 @@ from model.fmri_mlp import FmriMLPConfig
 from model.peft_utils import add_adapter
 from peft import LoraConfig
 from torch import Tensor
+from PIL import Image
+import os
+import random
 
 import lightning.pytorch as pl
-from collections import OrderedDict
+from metrics.image_metrics import compute_image_generation_metrics
+from deepspeed.ops.adam import DeepSpeedCPUAdam
+import wandb
 
+torch.set_float32_matmul_precision('high')
 
 class DiffusionOutput(tp.NamedTuple):
     image: Tensor
     losses: dict = None
     t_diffusion: Tensor = None
     brain_embeddings: dict = None
-
 
 class VersatileDiffusionConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
@@ -38,7 +40,6 @@ class VersatileDiffusionConfig(pydantic.BaseModel):
     vd_cache_dir: str = "/fsx-brainai/marlenec/vd_cache_dir"
     in_dim: int = 15724
     num_inference_steps: int = 20
-
 
     diffusion_noise_offset: bool = False
     prediction_type: str = "epsilon"
@@ -50,6 +51,8 @@ class VersatileDiffusionConfig(pydantic.BaseModel):
 
 
     brain_modules_config: dict[str, FmriMLPConfig] | None = None
+
+    learning_rate: float = 1e-4
 
 
 
@@ -72,23 +75,36 @@ class VersatileDiffusion(pl.LightningModule):
         config: VersatileDiffusionConfig | None = None,
         brain_n_in_channels: int | None = None,
         brain_temp_dim: int | None = None,
+        log_image_freq: int = 1,
+        compute_metrics_freq: int = 5,
+        num_metric_batches: int = 50,
+        num_eval_images: int = 5,
+        full_validate: bool = False
     ):
         super().__init__()
         config = config if config is not None else VersatileDiffusionConfig()
         self.config = config
+        # This will save all hyperparameters passed to __init__ to the checkpoint
+        self.save_hyperparameters(ignore=['config']) 
+
         self.drop_rate_clsfree = config.drop_rate_clsfree
         self.guidance_scale = 3.5
         self.diffusion_noise_offset = config.diffusion_noise_offset
         self.prediction_type = config.prediction_type
         self.noise_cubic_sampling = config.noise_cubic_sampling
-        in_dim = config.in_dim
         self.brain_modules_config = config.brain_modules_config
         self.training_strategy = config.training_strategy
-
         self.brain_n_in_channels = brain_n_in_channels
         self.brain_temp_dim = brain_temp_dim
+        self.log_image_freq = log_image_freq
+        self.compute_metrics_freq = compute_metrics_freq
+        self.num_metric_batches = num_metric_batches
+        self.num_eval_images = num_eval_images
 
+        self.full_validate = full_validate
 
+        self.is_metrics_epoch = False
+        self.is_log_image_epoch = False
 
         print("VD cache dir is : ", config.vd_cache_dir)
         try:
@@ -135,9 +151,6 @@ class VersatileDiffusion(pl.LightningModule):
         self.unet.enable_xformers_memory_efficient_attention()
 
 
-        self.vae.state_dict = partial(state_dict_cust, self=self.vae)
-
-
         if (
             self.brain_modules_config is not None
             and "blurry" in self.brain_modules_config.keys()
@@ -160,7 +173,6 @@ class VersatileDiffusion(pl.LightningModule):
             for brain_module_name in self.brain_modules_config.keys():
                 brain_module = self.brain_modules_config[brain_module_name]
                 brain_module = brain_module.build(
-
                     n_in_channels=brain_n_in_channels,
                     n_outputs=257 * 768,
                 )
@@ -175,7 +187,7 @@ class VersatileDiffusion(pl.LightningModule):
         ):
             set_requires_grad(self.unet.conv_in, True)
         if config.trainable_unet_layers == "lora":
-
+            print("Creating lora")
             self.unet._hf_peft_config_loaded = False
             self.unet.peft_config = {}
             unet_lora_config = LoraConfig(
@@ -190,75 +202,14 @@ class VersatileDiffusion(pl.LightningModule):
             )
             add_adapter(self.unet, unet_lora_config)
         elif config.trainable_unet_layers == "no":
+            print("no training unet")
             pass
         else:
             raise ValueError("config.trainable_unet_layers is unknown")
-
-    def training_step(self, batch: dict, batch_idx: int) -> Tensor:
-        """
-        Performs a single training step.
-        """
-        brain = batch["brain"]
-        img = batch["img"]
-        subject_idx = batch["subject_idx"]
-        output = self.forward(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=False)
-        # Extract losses from the output
-        total_loss = torch.tensor(0.0, device=self.device)
-        for loss_name, loss_value in output.losses.items():
-            self.log(f"train/{loss_name}_loss", loss_value, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            total_loss += loss_value
-
-        self.log("train/total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return total_loss
-
-    def validation_step(self, batch: dict, batch_idx: int) -> Tensor:
-        """
-        Performs a single validation step.
-        """
-        brain = batch["brain"]
-        img = batch["img"]
-        subject_idx = batch["subject_idx"]
-
-        # Call the model's forward method for validation (compute loss)
-        output = self.forward(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=False)
-
-        val_total_loss = torch.tensor(0.0, device=self.device)
-        for loss_name, loss_value in output.losses.items():
-            self.log(f"val/{loss_name}_loss", loss_value, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            val_total_loss += loss_value
-
-        self.log("val/total_loss", val_total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        return val_total_loss
-
-    def test_step(self, batch: dict, batch_idx: int) -> Tensor:
-        """
-        Performs a single test step (similar to validation for this model).
-        """
-        brain = batch["brain"]
-        img = batch["img"]
-        subject_idx = batch["subject_idx"]
-
-        # Call the model's forward method for testing
-        output = self.forward(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=False)
-
-        test_total_loss = torch.tensor(0.0, device=self.device)
-        for loss_name, loss_value in output.losses.items():
-            self.log(f"test/{loss_name}_loss", loss_value, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            test_total_loss += loss_value
-
-        self.log("test/total_loss", test_total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        return test_total_loss
-
-    def configure_optimizers(self):
-        """
-        Configures the optimizer for training.
-        """
-        # Ensure only trainable parameters are passed to the optimizer
-        trainable_params = self.collect_parameters()
-        optimizer = optim.AdamW(trainable_params, lr=self.config.hparams.learning_rate) # Access learning_rate from hparams
-        return optimizer
-
-
+        
+        self._validation_step_outputs_GT = []
+        self._validation_step_outputs_GEN = []
+        self._validation_step_outputs_PENULTIMATE = []
 
     def get_condition(
         self, brain: Tensor, subject_idx: Tensor, **kwargs
@@ -474,11 +425,6 @@ class VersatileDiffusion(pl.LightningModule):
 
     ):
 
-
-
-
-
-
         brain_clip_embeddings = brain_embeddings["clip_image"]["MSELoss"]
         img_lowlevel_latent = None
         if "blurry" in brain_embeddings:
@@ -627,13 +573,6 @@ class VersatileDiffusion(pl.LightningModule):
                         noise_pred_text - noise_pred_uncond
                     )
 
-
-
-
-
-
-
-
                 if img_lowlevel_latent != None:
                     latents = latents[:, :4]
                 res_prev = self.noise_scheduler.step(noise_pred, t, latents)
@@ -649,29 +588,199 @@ class VersatileDiffusion(pl.LightningModule):
 
             brain_recons = recons.unsqueeze(0)
 
-
-
-
         return DiffusionOutput(image=brain_recons[0], brain_embeddings=brain_embeddings)
+    
+    def configure_optimizers(self):
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        optimizer = DeepSpeedCPUAdam(
+            trainable_params, 
+            lr=1e-3, 
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01
+        )
 
-    def collect_parameters(
-        self,
-    ) -> List[nn.Parameter]:
-        """Return the trainable parameters of the model.
+        return optimizer
+    
+    def training_step(self, batch, batch_idx):
 
-        Returns:
-            model parameter_dict
+        brain = batch["brain"]
+        subject_idx = batch["subject_idx"]
+        img = batch["img"]
+
+        model_output = self(
+            brain=brain,
+            subject_idx=subject_idx,
+            img=img,
+            is_img_gen_mode=False
+        )
+
+        loss = model_output.losses["diffusion"]
+        self.log('train/diffusion_loss', loss, prog_bar=True, sync_dist=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        """Perform a single validation step."""
+        brain = batch["brain"]
+        subject_idx = batch["subject_idx"]
+        img = batch["img"]
+        
+        # 1. Calculate validation loss
+        val_loss_output = self(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=False)
+        val_loss = val_loss_output.losses["diffusion"]
+        self.log('val/loss', val_loss, on_step=False, on_epoch=True, sync_dist=False)
+
+        # 2. Generate images for logging/metrics
+        self.is_metrics_epoch = (self.current_epoch % self.compute_metrics_freq == 0) or self.trainer.is_last_batch or self.trainer.sanity_checking
+        self.is_log_image_epoch = (self.current_epoch % self.log_image_freq == 0) or self.trainer.is_last_batch or self.trainer.sanity_checking
+
+
+        should_do_full_pass = self.full_validate or\
+           (self.is_metrics_epoch and batch_idx < self.num_metric_batches) or \
+           (self.is_log_image_epoch and batch_idx == 0)
+        if should_do_full_pass:
+            
+            gen_output = self(brain=brain, subject_idx=subject_idx, img=img, is_img_gen_mode=True)
+    
+            if (gen_output.brain_embeddings and 'clip_image' in gen_output.brain_embeddings 
+                and 'penultimate_state' in gen_output.brain_embeddings['clip_image']):
+                pen_state = gen_output.brain_embeddings['clip_image']['penultimate_state']
+                self._validation_step_outputs_PENULTIMATE.append(pen_state.cpu())
+            
+            # Convert to PIL for metrics and logging
+            gen_batch = (gen_output.image.permute(0, 2, 3, 1) * 255.0).to(torch.uint8).cpu()
+            gt_batch = (img.permute(0, 2, 3, 1) * 255.0).to(torch.uint8).cpu()
+
+            self._validation_step_outputs_GEN.append(gen_batch)
+            self._validation_step_outputs_GT.append(gt_batch)
+            
+        return val_loss
+
+    def on_validation_epoch_end(self):
+        """Called at the end of the validation epoch to aggregate and log."""
+        if self.is_metrics_epoch or self.is_log_image_epoch:
+            
+            # Part 1: Each process saves its local results to a temporary file.
+            temp_dir = os.path.join(self.trainer.log_dir or ".", "temp_val_files")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Define unique file paths for each process (rank)
+            gen_path = os.path.join(temp_dir, f"gen_rank_{self.global_rank}.pt")
+            gt_path = os.path.join(temp_dir, f"gt_rank_{self.global_rank}.pt")
+            
+            # Save the lists of CPU tensors
+            torch.save(self._validation_step_outputs_GEN, gen_path)
+            torch.save(self._validation_step_outputs_GT, gt_path)
+            
+            # Clear the memory on each process
+            self._validation_step_outputs_GEN.clear()
+            self._validation_step_outputs_GT.clear()
+
+            # Handle penultimate states separately
+            if self._validation_step_outputs_PENULTIMATE:
+                penultimate_path = os.path.join(temp_dir, f"pen_rank_{self.global_rank}.pt")
+                torch.save(self._validation_step_outputs_PENULTIMATE, penultimate_path)
+                self._validation_step_outputs_PENULTIMATE.clear()
+
+            # Part 2: Wait for all processes to finish writing to disk.
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+            # Part 3: Only the main process (rank 0) loads all files and computes metrics.
+            if self.global_rank == 0:
+                all_gen_batches = []
+                all_gt_batches = []
+                all_pen_batches = []
+
+                # Loop through the files from all ranks
+                for i in range(self.trainer.world_size):
+                    gen_path_i = os.path.join(temp_dir, f"gen_rank_{i}.pt")
+                    gt_path_i = os.path.join(temp_dir, f"gt_rank_{i}.pt")
+                    
+                    all_gen_batches.extend(torch.load(gen_path_i))
+                    all_gt_batches.extend(torch.load(gt_path_i))
+                    
+                    # Clean up file after loading
+                    os.remove(gen_path_i)
+                    os.remove(gt_path_i)
+
+                    # Load penultimate states if they exist
+                    penultimate_path_i = os.path.join(temp_dir, f"pen_rank_{i}.pt")
+                    if os.path.exists(penultimate_path_i):
+                        all_pen_batches.extend(torch.load(penultimate_path_i))
+                        os.remove(penultimate_path_i)
+
+                # Clean up the temporary directory
+                os.rmdir(temp_dir)
+
+                # Concatenate all results in CPU RAM
+                all_gen_images = torch.cat(all_gen_batches, dim=0)
+                all_gt_images = torch.cat(all_gt_batches, dim=0)
+
+                # Process penultimate states if they were collected
+                if all_pen_batches:
+                    gathered_penultimate_states = torch.cat(all_pen_batches, dim=0)
+                    if self.is_metrics_epoch and not self.trainer.sanity_checking:
+                        save_dir = os.path.join(self.trainer.log_dir or "lightning_logs", "penultimate_fmri_states")
+                        os.makedirs(save_dir, exist_ok=True)
+                        save_path = os.path.join(save_dir, f"epoch_{self.current_epoch}.pt")
+                        torch.save(gathered_penultimate_states.cpu(), save_path)
+                        self.print(f"Saved penultimate fMRI states to {save_path}")
+
+                # --- Your existing logic for logging and metrics calculation now runs on CPU tensors ---
+                pil_gen_images = [Image.fromarray(img.numpy()) for img in all_gen_images]
+                pil_gt_images = [Image.fromarray(img.numpy()) for img in all_gt_images]
+
+                if self.full_validate or self.is_log_image_epoch:
+                    wandb_images = []
+                    for i, (gen_pil, gt_pil) in enumerate(zip(pil_gen_images[:self.num_eval_images], pil_gt_images[:self.num_eval_images])):
+                        wandb_images.append(wandb.Image(gen_pil, caption=f"Generated Image {i+1} (Epoch {self.current_epoch})"))
+                        wandb_images.append(wandb.Image(gt_pil, caption=f"Ground Truth {i+1} (Epoch {self.current_epoch})"))
+                    if not self.trainer.sanity_checking:
+                        self.logger.experiment.log({"val/generated_vs_ground_truth": wandb_images, "epoch": self.current_epoch})
+
+                if self.full_validate or self.is_metrics_epoch:
+                    print(f"Computing metrics on {len(pil_gen_images)} generated images...")
+                    image_gen_metrics = compute_image_generation_metrics(
+                        preds=pil_gen_images,
+                        trues=pil_gt_images,
+                        device=self.device
+                    )
+                    if not self.trainer.sanity_checking:
+                        self.log_dict({f"val/image_metrics/{k}": v for k, v in image_gen_metrics.items()}, sync_dist=False)
+                    print(f"Epoch {self.current_epoch} Image Generation Metrics: {image_gen_metrics}")
+        else:
+                        # Clear the memory on each process
+            self._validation_step_outputs_GEN.clear()
+            self._validation_step_outputs_GT.clear()
+    def on_save_checkpoint(self, checkpoint: tp.Dict[str, tp.Any]) -> None:
         """
+        Called by Lightning before saving a checkpoint.
+        We use this to remove the VAE weights from the state_dict,
+        as it is frozen and we don't need to save it.
+        """
+        # Keys are typically like 'state_dict', 'optimizer_states', 'epoch', etc.
+        if 'state_dict' in checkpoint:
+            model_state_dict = checkpoint['state_dict']
+            # Find all keys belonging to the VAE and remove them
+            keys_to_remove = [k for k in model_state_dict.keys() if k.startswith("vae.")]
+            if keys_to_remove:
+                print(f"INFO: Removing {len(keys_to_remove)} VAE keys from checkpoint before saving.")
+                for k in keys_to_remove:
+                    del model_state_dict[k]
 
-        model_parameters = {n: p for n, p in self.named_parameters() if p.requires_grad}
-
-        return [v for _, v in model_parameters.items()]
-
-
-def state_dict_cust(*args, destination=None, prefix="", keep_vars=False, self=None):
-    return OrderedDict()
-
+    def load_state_dict(self, state_dict: tp.Dict[str, tp.Any], strict: bool = True):
+        """
+        Override the default load_state_dict to use strict=False.
+        This allows us to load our partial checkpoints (which are missing VAE weights)
+        without raising a "Missing keys" error. The VAE will keep its pretrained weights
+        from the initial loading in __init__.
+        """
+        print("INFO: Custom load_state_dict called. Loading checkpoint with strict=False.")
+        # The 'super()' call refers to the parent LightningModule's method
+        super().load_state_dict(state_dict, strict=False)
 
 def set_requires_grad(module, value):
     for n, p in module.named_parameters():
         p.requires_grad = value
+

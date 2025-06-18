@@ -203,7 +203,7 @@ class FmriMLP(nn.Module):
         self,
         in_dim: int,
         out_dim: int,
-        config: FmriMLPConfig | None = None,
+        config: FmriMLPConfig,
     ):
         super().__init__()
 
@@ -330,7 +330,7 @@ class FmriMLP(nn.Module):
         x: torch.Tensor,
         subject_ids: torch.Tensor | None = None,
         channel_positions: torch.Tensor | None = None,  # Unused
-    ) -> torch.Tensor:
+    ) -> dict:
 
         if self.proj2flat is not None:
             bs = x.size(0)
@@ -377,6 +377,8 @@ class FmriMLP(nn.Module):
             x = self.out_time_agg(x)  # (B, F, 1)
         x = x.flatten(1)  # Ensure 2D
 
+        #penultimate_state = x
+
         if self.blurry_recon:
             b = self.blin1(x)
             b = self.bdropout(b)
@@ -388,5 +390,6 @@ class FmriMLP(nn.Module):
 
 
         return {
-            "MSELoss": x_final
+            "MSELoss": x_final,
+            #"penultimate_state": penultimate_state,
         }

@@ -2,7 +2,8 @@ data:
   batch_size: 20
   nsd_dataset_config:
     nsddata_path: ./nsddata
-    #subject_id: 1
+    processed_nsddata_path: ./processed_nsd_data
+    subject_ids: [1, 2, 5, 7]
     seed: 42
     averaged: true
     offset: 4.6
@@ -31,7 +32,7 @@ data:
   name: NeuroImagesDataModuleConfig
   pin_memory: true
   # test_groupbyimg: averaged
-  workers: 10
+  workers: 16
 infra:
   cluster: slurm 
   conda_env: null
@@ -75,7 +76,7 @@ versatilediffusion_config:
     use_tr_layer: true
   diffusion_noise_offset: true
   drop_rate_clsfree: 0.1
-  in_dim: 16724
+  in_dim: 16724 #15724
   name: VersatileDiffusion
   noise_cubic_sampling: true
   num_inference_steps: 20
